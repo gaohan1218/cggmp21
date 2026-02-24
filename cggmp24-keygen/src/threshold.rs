@@ -132,15 +132,17 @@ mod unambiguous {
     }
 }
 
+
+// 核心部分
 pub async fn run_threshold_keygen<E, R, M, L, D>(
     mut tracer: Option<&mut dyn Tracer>,
-    i: u16,
-    t: u16,
-    n: u16,
-    reliable_broadcast_enforced: bool,
-    sid: ExecutionId<'_>,
-    rng: &mut R,
-    party: M,
+    i: u16,  // 我是谁（第 i 号参与者）
+    t: u16,  // 阈值（最少要 t 个人才能签名）
+    n: u16,  // 一共有多少人
+    reliable_broadcast_enforced: bool,  // 是否做额外的“大家看到的广播内容一致吗？”检查
+    sid: ExecutionId<'_>,  // 这次协议的“会话编号”（防止别人把旧消息拿来骗你）
+    rng: &mut R,  // 随机数生成器（所有安全都靠随机数）
+    party: M,  // 
     #[cfg(feature = "hd-wallet")] hd_enabled: bool,
 ) -> Result<CoreKeyShare<E>, KeygenError>
 where
@@ -164,17 +166,27 @@ where
     let round3 = rounds.add_round(RoundInput::<MsgRound3<E>>::broadcast(i, n));
     let mut rounds = rounds.listen(incomings);
 
-    // Round 1
+    // Round 1 ： 每个人生成自己的“阈值秘密结构”，然后只发一个哈希commitment
     tracer.round_begins();
 
     tracer.stage("Sample rid_i, schnorr commitment, polynomial, chain_code");
     let mut rid = L::KappaBytes::default();
+    // 生成我的 rid_i：随机字节串
     rng.fill_bytes(rid.as_mut());
 
+    // 为 Schnorr 证明准备 commit
+    // h 就是我之后要公开的 “A_i”
+    // r 是我私下留着的临时随机数，后面生成证明用
     let (r, h) = schnorr_pok::prover_commits_ephemeral_secret::<E, _>(rng);
 
+    // 生成 Shamir 多项式（阈值核心）
+    // 我随机生成一个次数为 t-1 的多项式 f(x)
     let f = Polynomial::<SecretScalar<E>>::sample(rng, usize::from(t) - 1);
+    // 生成公开commitment F（Feldman VSS）
+    // 把多项式的系数都“乘上生成元 G”变成曲线点
     let F = &f * &Point::generator();
+    // 预计算我要发给每个人的私下份额 sigma_{i->j}
+    // 对每个参与者 j，我算一个数 sigma = f(j+1)
     let sigmas = (0..n)
         .map(|j| {
             let x = Scalar::from(j + 1);
@@ -193,6 +205,7 @@ where
     };
 
     tracer.stage("Commit to public data");
+    // 生成我 Round2 要公开的内容（decommitment）
     let my_decommitment = MsgRound2Broad {
         rid,
         F: F.clone(),
@@ -215,16 +228,18 @@ where
     let my_commitment = MsgRound1 {
         commitment: hash_commit,
     };
+    // 封装：outgoings 发送广播消息：我的 commitment
     outgoings
         .send(Outgoing::broadcast(Msg::Round1(my_commitment.clone())))
         .await
         .map_err(IoError::send_message)?;
     tracer.msg_sent();
 
-    // Round 2
+    // Round 2：收齐大家的承诺，然后公开我的内容 + 私下发份额
     tracer.round_begins();
 
     tracer.receive_msgs();
+    // 收到所有人的 Round1 承诺
     let commitments = rounds
         .complete(round1)
         .await
@@ -232,6 +247,11 @@ where
     tracer.msgs_received();
 
     // Optional reliability check
+    // 如果开启：
+        // 我把我看到的 commitments 全部 hash 得到 h_i
+        // 广播 h_i
+        // 看别人发的 h_j 是否等于 h_i
+        // 不等就 abort
     if reliable_broadcast_enforced {
         tracer.stage("Hash received msgs (reliability check)");
         let h_i = udigest::hash_iter::<D>(
@@ -270,6 +290,7 @@ where
     }
 
     tracer.send_msg();
+    // 广播我的 decommitment（Round2Broad）
     outgoings
         .feed(Outgoing::broadcast(Msg::Round2Broad(
             my_decommitment.clone(),
@@ -277,6 +298,7 @@ where
         .await
         .map_err(IoError::send_message)?;
 
+    // 给每个其他人私下发 sigma （Round2Uni）
     let messages = utils::iter_peers(i, n).map(|j| {
         let message = MsgRound2Uni {
             sigma: sigmas[usize::from(j)],
@@ -289,10 +311,11 @@ where
         .map_err(IoError::send_message)?;
     tracer.msg_sent();
 
-    // Round 3
+    // Round 3 ： 最关键的安全检查 + 生成最终份额 + Schnorr 证明
     tracer.round_begins();
 
     tracer.receive_msgs();
+    // 收到所有人的 Round2Broad 和 Round2Uni
     let decommitments = rounds
         .complete(round2_broad)
         .await
@@ -304,6 +327,7 @@ where
     tracer.msgs_received();
 
     tracer.stage("Validate decommitments");
+    // 检查：Round2Broad 是否匹配 Round1 的 commitment
     let blame = utils::collect_blame(&commitments, &decommitments, |j, com, decom| {
         let com_expected = udigest::hash::<D>(&unambiguous::HashCom {
             sid,
@@ -317,6 +341,7 @@ where
     }
 
     tracer.stage("Validate data size");
+    // 检查：多项式次数是否正确（必须 t-1）
     let blame = decommitments
         .iter_indexed()
         .filter(|(_, _, d)| d.F.degree() + 1 != usize::from(t))
@@ -327,6 +352,7 @@ where
     }
 
     tracer.stage("Validate Feldmann VSS");
+    // Feldman VSS 检查：他私下给你的 sigma 是否和他公开的 F 匹配
     let blame = decommitments
         .iter_indexed()
         .zip(sigmas_msg.iter())
@@ -340,6 +366,7 @@ where
     }
 
     tracer.stage("Compute rid");
+    // 计算全局 rid（大家的 rid XOR）
     let rid = decommitments
         .iter_including_me(&my_decommitment)
         .map(|d| &d.rid)
@@ -364,6 +391,7 @@ where
         None
     };
     tracer.stage("Compute Ys");
+    // 计算所有人的公开份额 Ys（每个人最终的公钥 share）
     let polynomial_sum = decommitments
         .iter_including_me(&my_decommitment)
         .map(|d| &d.F)
@@ -373,12 +401,14 @@ where
         .map(|y_j: Point<E>| NonZero::from_point(y_j).ok_or(Bug::ZeroShare))
         .collect::<Result<Vec<_>, _>>()?;
     tracer.stage("Compute sigma");
+    // 计算我自己的最终秘密份额 sigma_i
     let sigma: Scalar<E> = sigmas_msg.iter().map(|msg| msg.sigma).sum();
     let mut sigma = sigma + sigmas[usize::from(i)];
     let sigma = NonZero::from_secret_scalar(SecretScalar::new(&mut sigma)).ok_or(Bug::ZeroShare)?;
     debug_assert_eq!(Point::generator() * &sigma, ys[usize::from(i)]);
 
     tracer.stage("Calculate challenge");
+    // 生成 Schnorr 证明：证明我知道 sigma_i
     let challenge = Scalar::from_hash::<D>(&unambiguous::SchnorrPok {
         sid,
         prover: i,
@@ -399,10 +429,11 @@ where
         .map_err(IoError::send_message)?;
     tracer.msg_sent();
 
-    // Output round
+    // Output round ： 验证所有人的 Schnorr 证明，得到最终公钥
     tracer.round_begins();
 
     tracer.receive_msgs();
+    // 收到所有人的 Round3 proof
     let sch_proofs = rounds
         .complete(round3)
         .await
@@ -410,6 +441,7 @@ where
     tracer.msgs_received();
 
     tracer.stage("Validate schnorr proofs");
+    // 验证每个人的 Schnorr proof
     let blame = utils::collect_blame(&decommitments, &sch_proofs, |j, decom, sch_proof| {
         let challenge = Scalar::from_hash::<D>(&unambiguous::SchnorrPok {
             sid,
@@ -429,6 +461,7 @@ where
     }
 
     tracer.stage("Derive resulting public key and other data");
+    // 得到最终公钥 y（总公钥）
     let y: Point<E> = decommitments
         .iter_including_me(&my_decommitment)
         .map(|d| d.F.coefs()[0])
@@ -440,6 +473,11 @@ where
 
     tracer.protocol_ends();
 
+    // 返回结果：我本地要保存的东西
+    // shared_public_key = y
+    // public_shares = ys
+    // min_signers = t
+    // x = sigma (我自己的秘密份额)
     Ok(DirtyCoreKeyShare {
         i,
         key_info: DirtyKeyInfo {
